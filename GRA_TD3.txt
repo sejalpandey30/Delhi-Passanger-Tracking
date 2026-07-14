@@ -1,0 +1,1147 @@
+"""
+KINDLY CHANGE THE FILE LOCATION ACCORDING TO THE FOLDER WHERE YOU HAVE STORED THE DATASET.
+GRA-TD3: Graph Representation and Attention Based Twin Delayed Deep Deterministic
+Policy Gradient for Delhi Metro Passenger Route Guidance.
+
+Paper:
+  "Dynamic Passenger Route Guidance in the Multimodal Transit System
+   With Graph Representation and Attention Based Deep Reinforcement Learning"
+  Hao et al., IEEE T-ITS 2024
+
+Dataset: Delhi Metro
+  - OD_Flow_Apr_23.csv                              → Origin-Destination demand (255 stations)
+  - stationwise_hourly_entry_exit_february_2024.xlsx → Hourly entry/exit per station
+
+Key fixes vs. the original partial code:
+  1.  Network: stations within each line are already in route order in the Index
+      sheet (LINE01 row-0 is the first station, etc.).  We keep that order and
+      connect consecutive stations.  Stations that appear in the OD matrix but
+      NOT in the Index are added as isolated nodes so the matrices still line up.
+  2.  Reward / environment: the action is now a true *recommendation degree* per
+      station (∈ [-1,1]).  For every O-D pair we score all k-shortest routes by
+      summing their station recommendation degrees, then select the top route.
+      Passenger flow is redistributed accordingly, updating edge loads and SLRs.
+      This matches the paper's route-guidance mechanism (Sec III-B-2).
+  3.  SDNE: the custom NumPy auto-encoder is retained but the backward pass is
+      corrected — decoder W1-gradient used the wrong axis; fixed here.
+  4.  TD3 actor gradient: replaced the fragile finite-difference approximation
+      with a proper chain-rule backward pass through the critic → actor.
+"""
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from collections import deque
+import random
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1: DATA LOADING & NETWORK CONSTRUCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DelhiMetroDataLoader:
+    """Loads and preprocesses Delhi Metro OD and hourly flow data."""
+
+    PEAK_HOURS = ['HR7', 'HR8', 'HR9', 'HR10']
+
+    def __init__(self, od_path, xlsx_path):
+        # ── OD matrix ────────────────────────────────────────────────────────
+        print("[DataLoader] Loading OD matrix ...")
+        self.od_df = pd.read_csv(od_path)
+        self.stations = list(self.od_df['Stn.'])           # 255 station codes
+        self.station_idx = {s: i for i, s in enumerate(self.stations)}
+        self.N = len(self.stations)
+
+        raw = self.od_df.set_index('Stn.').reindex(
+            columns=self.stations).fillna(0).values.astype(np.float32)
+        np.fill_diagonal(raw, 0)
+        self.od_matrix = raw                               # (N, N)
+        print(f"  OD matrix: {self.N}×{self.N}, total flow = {raw.sum():.0f}")
+
+        # ── Hourly entry / exit ───────────────────────────────────────────────
+        print("[DataLoader] Loading peak-hour entry/exit ...")
+        self.entry_peak, self.exit_peak = self._load_peak_flows(xlsx_path)
+
+        # ── Network graph ─────────────────────────────────────────────────────
+        # FIX 1: rows in each line group are already in route order;
+        # we connect them consecutively.  Stations not in the Index sheet
+        # (extra OD-only nodes) are added as isolated nodes.
+        print("[DataLoader] Building metro network graph ...")
+        self.line_df = pd.read_excel(xlsx_path, sheet_name='Index')
+        self.G = self._build_network()
+        print(f"  Graph: {self.G.number_of_nodes()} nodes, "
+              f"{self.G.number_of_edges()//2} undirected edges")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def _load_peak_flows(self, xlsx_path):
+        entry = pd.read_excel(xlsx_path, sheet_name='february_2025_entry')
+        exit_ = pd.read_excel(xlsx_path, sheet_name='february_2025_exit')
+
+        entry_peak = (entry.groupby('station code')[self.PEAK_HOURS]
+                          .mean().sum(axis=1))
+        exit_peak  = (exit_.groupby('station code')[self.PEAK_HOURS]
+                          .mean().sum(axis=1))
+        return entry_peak, exit_peak
+
+    def _build_network(self):
+        G = nx.DiGraph()
+
+        # Add all OD stations as nodes first
+        for code in self.stations:
+            G.add_node(code,
+                       entry=float(self.entry_peak.get(code, 0)),
+                       exit=float(self.exit_peak.get(code, 0)),
+                       idx=self.station_idx[code])
+
+        # FIX 1 (continued): connect consecutive stations within each line.
+        # The Index sheet rows are already ordered along the route.
+        for line, grp in self.line_df.groupby('linename', sort=False):
+            codes = list(grp['station code'])          # already in route order
+            for i in range(len(codes) - 1):
+                u, v = codes[i], codes[i + 1]
+                if u not in self.station_idx or v not in self.station_idx:
+                    continue                            # skip non-OD stations
+                ui, vi = self.station_idx[u], self.station_idx[v]
+                # Edge weight = bidirectional OD demand (proxy for capacity usage)
+                flow = max(1.0, float(self.od_matrix[ui, vi] +
+                                      self.od_matrix[vi, ui]))
+                G.add_edge(u, v, weight=flow, line=line, capacity=2400.0)
+                G.add_edge(v, u, weight=flow, line=line, capacity=2400.0)
+
+        # FIX 1b: add zero-cost transfer edges between stations that share
+        # the same physical name but have different codes on different lines
+        # (Delhi Metro interchange stations like Kashmere Gate, Azadpur, etc.)
+        name_to_codes = {}
+        for _, row in self.line_df.iterrows():
+            name = row['station name']
+            code = row['station code']
+            name_to_codes.setdefault(name, []).append(code)
+
+        for name, codes in name_to_codes.items():
+            codes_in_od = [c for c in codes if c in self.station_idx]
+            for i in range(len(codes_in_od)):
+                for j in range(i + 1, len(codes_in_od)):
+                    u, v = codes_in_od[i], codes_in_od[j]
+                    # Transfer edge: small weight so it's traversable
+                    G.add_edge(u, v, weight=0.5, line='TRANSFER', capacity=2400.0)
+                    G.add_edge(v, u, weight=0.5, line='TRANSFER', capacity=2400.0)
+
+        return G
+
+    def get_od_between(self, src, dst):
+        si = self.station_idx.get(src, -1)
+        di = self.station_idx.get(dst, -1)
+        if si < 0 or di < 0:
+            return 0.0
+        return float(self.od_matrix[si, di])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2: STRUCTURAL DEEP NETWORK EMBEDDING (SDNE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SDNE:
+    """
+    NumPy implementation of Structural Deep Network Embedding.
+    Wang et al., KDD 2016.
+
+    FIX 3: corrected backward pass — the decoder uses W1.T, so the gradient
+    w.r.t. W1 from the decoder branch is  H1d.T @ dXh_z  (shape hidden×N),
+    transposed to N×hidden before adding to the encoder branch gradient.
+    """
+
+    def __init__(self, n_nodes, embed_dim=32, hidden=64,
+                 alpha=0.01, gamma=0.1, lr=0.005, epochs=60):
+        self.n      = n_nodes
+        self.d      = embed_dim
+        self.alpha  = alpha
+        self.gamma  = gamma
+        self.lr     = lr
+        self.epochs = epochs
+
+        s1 = np.sqrt(2.0 / (n_nodes + hidden))
+        s2 = np.sqrt(2.0 / (hidden + embed_dim))
+        self.W1 = np.random.randn(n_nodes, hidden).astype(np.float32) * s1
+        self.b1 = np.zeros(hidden, dtype=np.float32)
+        self.W2 = np.random.randn(hidden, embed_dim).astype(np.float32) * s2
+        self.b2 = np.zeros(embed_dim, dtype=np.float32)
+
+    @staticmethod
+    def _relu(x):   return np.maximum(0, x)
+    @staticmethod
+    def _drelu(x):  return (x > 0).astype(np.float32)
+
+    # ── Encode ────────────────────────────────────────────────────────────────
+    def encode(self, X):
+        H1 = self._relu(X @ self.W1 + self.b1)
+        Y  = self._relu(H1 @ self.W2 + self.b2)
+        return Y
+
+    # ── Fit ───────────────────────────────────────────────────────────────────
+    def fit(self, adj):
+        row_sum = adj.sum(axis=1, keepdims=True)
+        row_sum[row_sum == 0] = 1
+        X = (adj / row_sum).astype(np.float32)             # row-normalised
+
+        # Penalty matrix: non-zero entries penalised more (Eq. SDNE paper)
+        B = np.where(X > 0, 10.0, 1.0).astype(np.float32)
+
+        # Laplacian for 1st-order proximity
+        D   = np.diag(X.sum(axis=1))
+        Lap = D - X
+
+        print(f"[SDNE] Training {self.epochs} epochs ...")
+        losses = []
+        for ep in range(self.epochs):
+            # Forward
+            H1  = self._relu(X @ self.W1 + self.b1)        # (N, h)
+            Y   = self._relu(H1 @ self.W2 + self.b2)       # (N, d)
+            H1d = self._relu(Y @ self.W2.T + self.b1)      # (N, h)  decoder
+            Xh  = self._relu(H1d @ self.W1.T)              # (N, N)
+
+            # Losses
+            diff  = (Xh - X) * B
+            L2nd  = 0.5 * float(np.mean(diff ** 2))
+            L1st  = self.alpha * float(np.trace(Y.T @ Lap @ Y)) / self.n
+            Lreg  = self.gamma * float(np.sum(self.W1**2) + np.sum(self.W2**2))
+            loss  = L2nd + L1st + Lreg
+            losses.append(loss)
+
+            # ── Backward ─────────────────────────────────────────────────────
+            nb = len(X)
+
+            # --- Decoder branch ---
+            # Xh = relu(H1d @ W1.T)
+            dXh   = (diff * B) / nb                        # (N, N)
+            dXh_z = dXh * self._drelu(H1d @ self.W1.T)    # (N, N)
+            # FIX 3: grad w.r.t W1 from decoder = (H1d.T @ dXh_z).T  (N, h)
+            dW1_dec = (H1d.T @ dXh_z).T                   # (N, h)
+            dH1d    = dXh_z @ self.W1                      # (N, h)
+
+            # H1d = relu(Y @ W2.T + b1)
+            dH1d_z  = dH1d * self._drelu(Y @ self.W2.T + self.b1)  # (N, h)
+            dW2_dec = Y.T @ dH1d_z                                   # (d, h)
+            db1_dec = dH1d_z.mean(axis=0)
+            dY_dec  = dH1d_z @ self.W2                               # (N, d)
+
+            # 1st-order proximity gradient
+            dY_lap  = (2 * self.alpha / self.n) * (Lap @ Y)         # (N, d)
+
+            dY = dY_dec + dY_lap
+
+            # --- Encoder branch ---
+            # Y = relu(H1 @ W2 + b2)
+            dY_z    = dY * self._drelu(H1 @ self.W2 + self.b2)      # (N, d)
+            dW2_enc = H1.T @ dY_z                                     # (h, d)
+            db2     = dY_z.mean(axis=0)
+            dH1     = dY_z @ self.W2.T                               # (N, h)
+
+            # H1 = relu(X @ W1 + b1)
+            dH1_z   = dH1 * self._drelu(X @ self.W1 + self.b1)      # (N, h)
+            dW1_enc = X.T @ dH1_z                                     # (N, h)
+            db1_enc = dH1_z.mean(axis=0)
+
+            # Combined gradients + L2 regularisation
+            dW1 = dW1_enc + dW1_dec + 2 * self.gamma * self.W1
+            dW2 = dW2_enc + dW2_dec.T + 2 * self.gamma * self.W2
+            db1 = db1_enc + db1_dec
+
+            self.W1 -= self.lr * np.clip(dW1, -1, 1)
+            self.W2 -= self.lr * np.clip(dW2, -1, 1)
+            self.b1 -= self.lr * db1
+            self.b2 -= self.lr * db2
+
+            if (ep + 1) % 20 == 0:
+                print(f"  epoch {ep+1:3d}/{self.epochs}  loss={loss:.5f}")
+
+        print(f"[SDNE] Done. Final loss = {losses[-1]:.5f}")
+        return losses
+
+    def get_embeddings(self, adj):
+        row_sum = adj.sum(axis=1, keepdims=True)
+        row_sum[row_sum == 0] = 1
+        X  = (adj / row_sum).astype(np.float32)
+        H1 = self._relu(X @ self.W1 + self.b1)
+        return self._relu(H1 @ self.W2 + self.b2)          # (N, d)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3: NEURAL NETWORK LAYERS (NumPy, with gradients stored for backprop)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def glorot(shape):
+    fan = sum(shape[:2]) if len(shape) >= 2 else shape[0]
+    return np.random.randn(*shape).astype(np.float32) * np.sqrt(2.0 / fan)
+
+
+class DenseLayer:
+    def __init__(self, in_dim, out_dim, activation='relu'):
+        self.W   = glorot((in_dim, out_dim))
+        self.b   = np.zeros(out_dim, dtype=np.float32)
+        self.act = activation
+        self.x   = None
+        self.z   = None
+
+    def forward(self, x):
+        self.x = x
+        self.z = x @ self.W + self.b
+        if self.act == 'relu':   return np.maximum(0, self.z)
+        if self.act == 'tanh':   return np.tanh(self.z)
+        return self.z  # linear
+
+    def backward(self, dout, lr):
+        if self.act == 'relu':
+            dz = dout * (self.z > 0)
+        elif self.act == 'tanh':
+            dz = dout * (1.0 - np.tanh(self.z) ** 2)
+        else:
+            dz = dout
+
+        dW = self.x.T @ dz
+        db = dz.mean(axis=0)
+        dx = dz @ self.W.T
+        self.W -= lr * np.clip(dW, -1.0, 1.0)
+        self.b -= lr * np.clip(db, -1.0, 1.0)
+        return dx
+
+    def copy_from(self, other, tau=1.0):
+        self.W = tau * other.W + (1 - tau) * self.W
+        self.b = tau * other.b + (1 - tau) * self.b
+
+
+class SelfAttention:
+    """Scaled dot-product self-attention (single 'token' = flattened feature vector)."""
+
+    def __init__(self, d_model, d_k=16):
+        self.d_k = d_k
+        self.Wq  = glorot((d_model, d_k))
+        self.Wk  = glorot((d_model, d_k))
+        self.Wv  = glorot((d_model, d_k))
+        # Cache for backward
+        self.x   = None
+        self.attn = None
+        self.V    = None
+
+    def forward(self, x):
+        self.x = x
+        Q = x @ self.Wq                                    # (B, d_k)
+        K = x @ self.Wk
+        self.V = x @ self.Wv
+        score = (Q * K).sum(axis=-1, keepdims=True) / np.sqrt(self.d_k)
+        self.attn = 1.0 / (1.0 + np.exp(-score))          # sigmoid gate
+        return self.attn * self.V                          # (B, d_k)
+
+    def backward(self, dout, lr):
+        """Approximate backward: only update projection matrices."""
+        # dout: (B, d_k)
+        # Gradient w.r.t V
+        dV    = self.attn * dout                           # (B, d_k)
+        dWv   = self.x.T @ dV
+        # Gradient w.r.t attention (sigmoid)
+        d_attn = (dout * self.V).sum(axis=-1, keepdims=True)  # (B,1)
+        d_attn *= self.attn * (1 - self.attn)
+        # Gradient w.r.t Q, K
+        dQ = d_attn * (self.x @ self.Wk) / np.sqrt(self.d_k)
+        dK = d_attn * (self.x @ self.Wq) / np.sqrt(self.d_k)
+        dWq = self.x.T @ dQ
+        dWk = self.x.T @ dK
+
+        self.Wq -= lr * np.clip(dWq, -1, 1)
+        self.Wk -= lr * np.clip(dWk, -1, 1)
+        self.Wv -= lr * np.clip(dWv, -1, 1)
+
+        dx  = dV @ self.Wv.T + dQ @ self.Wq.T + dK @ self.Wk.T
+        return dx
+
+    def copy_from(self, other, tau=1.0):
+        self.Wq = tau * other.Wq + (1 - tau) * self.Wq
+        self.Wk = tau * other.Wk + (1 - tau) * self.Wk
+        self.Wv = tau * other.Wv + (1 - tau) * self.Wv
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4: ACTOR & CRITIC NETWORKS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ActorNetwork:
+    """
+    GRA actor (Fig. 4 in paper).
+      Module 1a: FC + Self-Attention on SLR state
+      Module 1b: FC + Self-Attention on station waiting counts
+      Module 2 : FC on PDER (SDNE embedding of subsequent OD demand)
+    Output: recommendation degree per station ∈ [-1, 1] (tanh)
+    """
+
+    def __init__(self, n_stations, embed_dim=32, hidden=64, attn_k=16):
+        self.n = n_stations
+        h2 = hidden // 2
+        # Module 1a — SLR branch
+        self.slr_fc1  = DenseLayer(n_stations, hidden, 'relu')
+        self.slr_fc2  = DenseLayer(hidden, h2,     'relu')
+        self.slr_attn = SelfAttention(h2, attn_k)
+        # Module 1b — station waiting branch
+        self.stn_fc1  = DenseLayer(n_stations, hidden, 'relu')
+        self.stn_fc2  = DenseLayer(hidden, h2,     'relu')
+        self.stn_attn = SelfAttention(h2, attn_k)
+        # Module 2 — PDER branch
+        self.pdr_fc1  = DenseLayer(embed_dim, hidden, 'relu')
+        self.pdr_fc2  = DenseLayer(hidden, h2,     'relu')
+        # Fusion
+        fuse_in = attn_k * 2 + h2
+        self.fc_out   = DenseLayer(fuse_in, n_stations, 'tanh')
+
+    def forward(self, slr, stn, pder):
+        h1  = self.slr_fc2.forward(self.slr_fc1.forward(slr))
+        a1  = self.slr_attn.forward(h1)
+        h2  = self.stn_fc2.forward(self.stn_fc1.forward(stn))
+        a2  = self.stn_attn.forward(h2)
+        h3  = self.pdr_fc2.forward(self.pdr_fc1.forward(pder))
+        fuse = np.concatenate([a1, a2, h3], axis=-1)
+        return self.fc_out.forward(fuse)
+
+    def backward(self, d_action, lr):
+        """Backprop gradient through the actor (for policy update)."""
+        dx_fuse = self.fc_out.backward(d_action, lr)
+        attn_k  = self.slr_attn.d_k
+        h2_dim  = self.slr_fc2.W.shape[1]
+
+        da1  = dx_fuse[:, :attn_k]
+        da2  = dx_fuse[:, attn_k:attn_k*2]
+        dh3  = dx_fuse[:, attn_k*2:]
+
+        # Module 1a
+        dh1  = self.slr_attn.backward(da1, lr)
+        dh1  = self.slr_fc2.backward(dh1, lr)
+        self.slr_fc1.backward(dh1, lr)
+        # Module 1b
+        dh2  = self.stn_attn.backward(da2, lr)
+        dh2  = self.stn_fc2.backward(dh2, lr)
+        self.stn_fc1.backward(dh2, lr)
+        # Module 2
+        dh3  = self.pdr_fc2.backward(dh3, lr)
+        self.pdr_fc1.backward(dh3, lr)
+
+    def get_dense_layers(self):
+        return [self.slr_fc1, self.slr_fc2, self.stn_fc1,
+                self.stn_fc2, self.pdr_fc1, self.pdr_fc2, self.fc_out]
+
+    def get_attn_layers(self):
+        return [self.slr_attn, self.stn_attn]
+
+    def copy_from(self, other, tau=1.0):
+        for a, b in zip(self.get_dense_layers(), other.get_dense_layers()):
+            a.copy_from(b, tau)
+        for a, b in zip(self.get_attn_layers(), other.get_attn_layers()):
+            a.copy_from(b, tau)
+
+
+class CriticNetwork:
+    """
+    TD3 critic Q(s, a) — 3-layer FC (paper Sec IV-B-2).
+    Input: concat(slr, stn, pder, action).
+    """
+
+    def __init__(self, n_stations, embed_dim=32, hidden=128):
+        in_dim   = n_stations * 2 + embed_dim + n_stations
+        self.fc1 = DenseLayer(in_dim, hidden, 'relu')
+        self.fc2 = DenseLayer(hidden, hidden, 'relu')
+        self.fc3 = DenseLayer(hidden, 1,      'linear')
+
+    def forward(self, slr, stn, pder, action):
+        x = np.concatenate([slr, stn, pder, action], axis=-1)
+        return self.fc3.forward(
+               self.fc2.forward(
+               self.fc1.forward(x))).squeeze(-1)
+
+    def backward_critic(self, slr, stn, pder, action, target_q, lr):
+        """Critic update: minimise (Q - y)² (Eq. 24)."""
+        x   = np.concatenate([slr, stn, pder, action], axis=-1)
+        h1  = self.fc1.forward(x)
+        h2  = self.fc2.forward(h1)
+        q   = self.fc3.forward(h2).squeeze(-1)
+        err = q - target_q
+        loss = float(np.mean(err ** 2))
+        dq  = (2 * err / len(err))[:, None]
+        dh2 = self.fc3.backward(dq, lr)
+        dh1 = self.fc2.backward(dh2, lr)
+        self.fc1.backward(dh1, lr)
+        return loss
+
+    def grad_wrt_action(self, slr, stn, pder, action):
+        """
+        FIX 4: return ∂Q/∂a analytically via chain rule.
+        Used by the actor update (Eq. 25).
+        """
+        x  = np.concatenate([slr, stn, pder, action], axis=-1)
+        h1 = self.fc1.forward(x)
+        h2 = self.fc2.forward(h1)
+        q  = self.fc3.forward(h2)
+
+        # Backprop a unit gradient through the critic to obtain dQ/dx
+        dq = np.ones_like(q)
+        d2 = self.fc3.W.T * (1.0)                         # linear output
+        # chain through fc3 (linear): dh2 = dq @ fc3.W.T
+        dh2 = dq @ self.fc3.W.T                            # (B, hidden)
+        # chain through fc2 (relu)
+        dh2_z = dh2 * (h2 > 0)
+        dh1   = dh2_z @ self.fc2.W.T                       # (B, hidden)
+        # chain through fc1 (relu)
+        dh1_z = dh1 * (h1 > 0)
+        dx    = dh1_z @ self.fc1.W.T                       # (B, in_dim)
+
+        n_act = action.shape[-1]
+        return dx[:, -n_act:]                              # ∂Q/∂action
+
+    def get_layers(self):
+        return [self.fc1, self.fc2, self.fc3]
+
+    def copy_from(self, other, tau=1.0):
+        for a, b in zip(self.get_layers(), other.get_layers()):
+            a.copy_from(b, tau)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5: REPLAY BUFFER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ReplayBuffer:
+    def __init__(self, capacity=20_000):
+        self.buf = deque(maxlen=capacity)
+
+    def push(self, slr, stn, pder, action, reward, slr2, stn2, pder2):
+        self.buf.append((slr, stn, pder, action, reward, slr2, stn2, pder2))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buf, batch_size)
+        slr, stn, pder, action, reward, slr2, stn2, pder2 = zip(*batch)
+        return (np.vstack(slr).astype(np.float32),
+                np.vstack(stn).astype(np.float32),
+                np.vstack(pder).astype(np.float32),
+                np.vstack(action).astype(np.float32),
+                np.array(reward, dtype=np.float32),
+                np.vstack(slr2).astype(np.float32),
+                np.vstack(stn2).astype(np.float32),
+                np.vstack(pder2).astype(np.float32))
+
+    def __len__(self):
+        return len(self.buf)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6: TRANSIT ENVIRONMENT  (FIX 2 — proper route-guidance mechanism)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DelhiMetroEnv:
+    """
+    Simulates the Delhi Metro under the GRA-TD3 route guidance.
+
+    State   : (SLR per station, normalised waiting passengers per station)
+    Action  : recommendation degree per station ∈ [-1, 1]
+    Reward  : Eq. 18 from paper — weighted sum of congestion, utility, emission
+
+    FIX 2 — route-guidance mechanism:
+      For each O-D pair with non-trivial flow we pre-compute up to K=3
+      shortest paths.  At each step the action vector gives a recommendation
+      score for every station; we select the route whose stations score
+      highest (sum of recommendation degrees along the path).  Passenger
+      flow is assigned to edges of the selected route, from which SLRs are
+      derived — exactly matching Eqs. 1-5 of the paper.
+    """
+
+    TRAIN_CAPACITY = 2400      # passengers / train (6-car Delhi Metro)
+    METRO_EMISSION = 10.7      # g CO₂ per passenger-km (paper value)
+    BUS_EMISSION   = 13.14     # g CO₂ per passenger-km (paper value)
+    THETA = np.array([-1.65, -0.0339, -0.284])   # utility params (paper)
+
+    # k-shortest paths to consider per O-D pair
+    K_ROUTES = 3
+    # Only compute routes for O-D pairs with flow > this threshold
+    MIN_OD_FLOW = 10.0
+    # Average trip distance (km) — Delhi Metro average
+    AVG_DIST_KM = 11.0
+
+    def __init__(self, data_loader, embeddings, omega=(1.0, 1.0, 1.0)):
+        self.dl   = data_loader
+        self.emb  = embeddings                             # (N, embed_dim)
+        self.N    = data_loader.N
+        self.G    = data_loader.G
+        self.omega_sec, self.omega_util, self.omega_emis = omega
+
+        # Peak-hour base entry / exit flows
+        self.base_entry = np.array(
+            [float(data_loader.entry_peak.get(s, 0)) for s in data_loader.stations],
+            dtype=np.float32)
+        self.base_exit = np.array(
+            [float(data_loader.exit_peak.get(s, 0)) for s in data_loader.stations],
+            dtype=np.float32)
+
+        # Edge betweenness centrality → section importance weights ω_s (Eq. 6-7)
+        print("[Env] Computing edge betweenness centrality ...")
+        bc = nx.edge_betweenness_centrality(self.G, weight='weight', normalized=True)
+        max_bc = max(bc.values()) if bc else 1.0
+        self.section_weight = {e: v / (max_bc + 1e-9) for e, v in bc.items()}
+
+        # Pre-compute k-shortest route sets for significant O-D pairs
+        print("[Env] Pre-computing k-shortest routes for O-D pairs ...")
+        self._precompute_routes()
+        print(f"  {len(self.od_routes)} O-D pairs with routes precomputed.")
+
+        # Normalisation constants for SLR reward (Eq. 8-9)
+        n_edges = self.G.number_of_edges()
+        self.max_eps_sec = float(n_edges)   # every edge SLR = 1
+        self.min_eps_sec = 0.0
+
+        self._reset_state()
+        print("[Env] Environment ready.")
+
+    # ── Pre-compute routes ────────────────────────────────────────────────────
+    def _precompute_routes(self):
+        """
+        For each (O, D) pair with significant OD flow, compute up to K
+        shortest simple paths.  We store them as lists of station indices.
+        """
+        od  = self.dl.od_matrix
+        idx = self.dl.station_idx
+        stns = self.dl.stations
+        self.od_routes = {}   # (i, j) → list of paths, each path = list of node indices
+
+        pairs = list(zip(*np.where(od > self.MIN_OD_FLOW)))
+        # Sample at most 500 pairs to keep startup time reasonable
+        if len(pairs) > 500:
+            rng = np.random.default_rng(42)
+            pairs = [pairs[k] for k in rng.choice(len(pairs), 500, replace=False)]
+
+        for (i, j) in pairs:
+            src, dst = stns[i], stns[j]
+            if src not in self.G or dst not in self.G:
+                continue
+            if src == dst:
+                continue
+            try:
+                paths = []
+                gen = nx.shortest_simple_paths(self.G, src, dst, weight='weight')
+                for _ in range(self.K_ROUTES):
+                    p = next(gen)
+                    paths.append([idx[n] for n in p if n in idx])
+                self.od_routes[(i, j)] = paths
+            except (nx.NetworkXNoPath, nx.NodeNotFound, StopIteration):
+                pass
+
+    # ── State initialisation ──────────────────────────────────────────────────
+    def _reset_state(self):
+        # Assign passengers to edges based on OD flows and shortest paths
+        self.edge_load = {}                                # (u_idx, v_idx) → passengers
+        for e in self.G.edges():
+            self.edge_load[e] = 0.0
+
+        # Distribute base OD flow along shortest paths (uniform over alternatives)
+        od   = self.dl.od_matrix
+        stns = self.dl.stations
+
+        for (i, j), paths in self.od_routes.items():
+            flow = od[i, j] / max(len(paths), 1)
+            for path_idx in paths:
+                for k in range(len(path_idx) - 1):
+                    u_idx = path_idx[k]
+                    v_idx = path_idx[k + 1]
+                    u = stns[u_idx]
+                    v = stns[v_idx]
+                    if self.G.has_edge(u, v):
+                        self.edge_load[(u, v)] = self.edge_load.get((u, v), 0.0) + flow
+
+        # Station-level waiting passengers (15% of entry flow, as proxy)
+        self.waiting = self.base_entry * 0.15
+        self._update_slr()
+
+    def _update_slr(self):
+        """Compute SLR per station as average load rate of adjacent edges (Eq. 1-2)."""
+        slr_sum   = np.zeros(self.N, dtype=np.float32)
+        slr_count = np.zeros(self.N, dtype=np.float32)
+
+        for (u, v), load in self.edge_load.items():
+            u_idx = self.dl.station_idx.get(u, -1)
+            v_idx = self.dl.station_idx.get(v, -1)
+            if u_idx < 0 or v_idx < 0:
+                continue
+            cap  = self.G[u][v].get('capacity', self.TRAIN_CAPACITY)
+            rate = min(1.0, load / (cap + 1e-9))
+            slr_sum[u_idx]   += rate
+            slr_count[u_idx] += 1
+            slr_sum[v_idx]   += rate
+            slr_count[v_idx] += 1
+
+        slr_count[slr_count == 0] = 1
+        self.slr = np.clip(slr_sum / slr_count, 0.0, 1.0).astype(np.float32)
+
+    # ── State accessors ───────────────────────────────────────────────────────
+    def get_state(self):
+        """Returns (slr, waiting) each shape (1, N), normalised."""
+        max_w = self.waiting.max() + 1e-9
+        return (self.slr[None, :].copy(),
+                (self.waiting / max_w)[None, :].copy())
+
+    def get_pder(self):
+        """
+        Passenger Demand Embedding Representation (Module 2 in Fig. 4).
+        We use a weighted average of SDNE station embeddings, weighted by
+        remaining OD demand — a tractable approximation for the paper's
+        'subsequent OD matrix embedding'.
+        Returns shape (1, embed_dim).
+        """
+        row_demand = self.dl.od_matrix.sum(axis=1)         # (N,)
+        total = row_demand.sum() + 1e-9
+        pder  = (row_demand[:, None] * self.emb).sum(axis=0, keepdims=True) / total
+        return pder.astype(np.float32)                     # (1, embed_dim)
+
+    # ── Environment step ──────────────────────────────────────────────────────
+    def step(self, action):
+        """
+        FIX 2: Route-guidance via recommendation degrees.
+
+        For each O-D pair, score each pre-computed alternative route by
+        summing its stations' recommendation degrees.  Assign all passenger
+        flow to the highest-scoring route, redistributing edge loads.
+
+        action : np.ndarray (N,) ∈ [-1, 1]
+        Returns : (reward_tuple, slr_next, wait_next)
+        """
+        # Reset edge loads then re-assign under current guidance
+        for k in self.edge_load:
+            self.edge_load[k] = 0.0
+
+        od   = self.dl.od_matrix
+        stns = self.dl.stations
+
+        for (i, j), paths in self.od_routes.items():
+            od_flow = od[i, j]
+            if od_flow <= 0 or not paths:
+                continue
+
+            # Score each route: sum of recommendation degrees along its stations
+            scores = []
+            for path_idx in paths:
+                score = float(action[path_idx].sum())
+                scores.append(score)
+
+            # Select the route with the highest aggregate recommendation
+            best = paths[int(np.argmax(scores))]
+
+            # Assign all O-D flow to edges of the selected route
+            for k in range(len(best) - 1):
+                u = stns[best[k]]
+                v = stns[best[k + 1]]
+                if self.G.has_edge(u, v):
+                    self.edge_load[(u, v)] = (self.edge_load.get((u, v), 0.0)
+                                              + od_flow)
+
+        self.waiting = self.base_entry * 0.15
+        self._update_slr()
+
+        reward = self._compute_reward(action)
+        slr_n, wait_n = self.get_state()
+        return reward, slr_n, wait_n
+
+    # ── Reward computation (Eq. 8-18) ────────────────────────────────────────
+    def _compute_reward(self, action):
+
+        # R_section (Eq. 8-9): weighted summation of SLRs, normalised
+        eps_sec = 0.0
+        for (u, v), w in self.section_weight.items():
+            u_idx = self.dl.station_idx.get(u, -1)
+            if u_idx >= 0:
+                eps_sec += w * float(self.slr[u_idx])
+
+        R_sec = float(np.clip(
+            (self.max_eps_sec - eps_sec) / (self.max_eps_sec - self.min_eps_sec + 1e-9),
+            0, 1))
+
+        # R_utility (Eq. 13-14): proxy using average SLR to estimate travel time
+        avg_slr     = float(self.slr.mean())
+        travel_time = 0.5 + avg_slr * 1.0    # 30–90 min in hours
+        wait_time   = avg_slr * 0.25
+        n_transfers = 1.5                     # typical Delhi Metro journey
+        travel_cost = 45.0                    # INR average
+
+        utility = (self.THETA[0] * (travel_time + wait_time) +
+                   self.THETA[1] * n_transfers +
+                   self.THETA[2] * travel_cost)
+
+        max_util = self.THETA[0] * 0.5 + self.THETA[1] * 0   + self.THETA[2] * 15
+        min_util = self.THETA[0] * 1.75+ self.THETA[1] * 4.0 + self.THETA[2] * 90
+        R_util   = float(np.clip(
+            (utility - min_util) / (max_util - min_util + 1e-9), 0, 1))
+
+        # R_emission (Eq. 16-17)
+        total_flow   = sum(self.edge_load.values())
+        eps_emis     = total_flow * self.METRO_EMISSION * self.AVG_DIST_KM
+        # Passengers guided to bus routes (approximated by negative-action mass)
+        bus_share    = float(np.maximum(0, -action).mean()) * 0.1
+        eps_emis    += bus_share * total_flow * self.BUS_EMISSION * self.AVG_DIST_KM
+
+        max_emis = total_flow * self.BUS_EMISSION  * self.AVG_DIST_KM * 1.2
+        min_emis = total_flow * self.METRO_EMISSION * self.AVG_DIST_KM * 0.8
+        R_emis   = float(np.clip(
+            (max_emis - eps_emis) / (max_emis - min_emis + 1e-9), 0, 1))
+
+        R = (self.omega_sec  * R_sec  +
+             self.omega_util * R_util +
+             self.omega_emis * R_emis)
+        return float(R), float(R_sec), float(R_util), float(R_emis)
+
+    def reset(self):
+        self._reset_state()
+        return self.get_state()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7: GRA-TD3 AGENT  (Algorithm 2 from paper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GRATD3Agent:
+    """
+    GRA-TD3 with FIX 4: actor gradient via analytic chain rule through
+    critic (instead of finite-difference approximation).
+    Hyperparameters match Table II of the paper.
+    """
+
+    def __init__(self, n_stations, embed_dim=32,
+                 lr_actor=3e-4, lr_critic=3e-4,
+                 gamma=0.99, tau=0.005,
+                 sigma_e=0.2, sigma_p=0.4, r_p=1.0, f_p=2,
+                 batch_size=32):
+        self.N      = n_stations
+        self.lr_a   = lr_actor
+        self.lr_c   = lr_critic
+        self.gamma  = gamma
+        self.tau    = tau
+        self.sig_e  = sigma_e    # exploration noise σ_e
+        self.sig_p  = sigma_p    # target policy smoothing σ_p
+        self.r_p    = r_p        # noise clip range
+        self.f_p    = f_p        # delayed update frequency
+        self.bs     = batch_size
+
+        # Six networks as in paper
+        self.actor         = ActorNetwork(n_stations, embed_dim)
+        self.actor_tgt     = ActorNetwork(n_stations, embed_dim)
+        self.actor_tgt.copy_from(self.actor, tau=1.0)
+
+        self.critic1       = CriticNetwork(n_stations, embed_dim)
+        self.critic1_tgt   = CriticNetwork(n_stations, embed_dim)
+        self.critic1_tgt.copy_from(self.critic1, tau=1.0)
+
+        self.critic2       = CriticNetwork(n_stations, embed_dim)
+        self.critic2_tgt   = CriticNetwork(n_stations, embed_dim)
+        self.critic2_tgt.copy_from(self.critic2, tau=1.0)
+
+        self.buffer = ReplayBuffer(20_000)
+        self.t      = 0
+
+    # ── Action selection (Algorithm 2, line 5) ────────────────────────────────
+    def select_action(self, slr, stn, pder, add_noise=True):
+        a = self.actor.forward(slr, stn, pder)
+        if add_noise:
+            a = np.clip(a + np.random.normal(0, self.sig_e, a.shape), -1, 1)
+        return a.astype(np.float32)
+
+    def store(self, slr, stn, pder, action, reward, slr2, stn2, pder2):
+        self.buffer.push(slr, stn, pder, action, reward, slr2, stn2, pder2)
+
+    # ── Network update (Algorithm 2, lines 8-13) ──────────────────────────────
+    def update(self):
+        if len(self.buffer) < self.bs:
+            return None, None
+
+        self.t += 1
+        (slr, stn, pder, action, reward,
+         slr2, stn2, pder2) = self.buffer.sample(self.bs)
+
+        # --- Target action with smoothing noise (Eq. 22) ---
+        a_next = self.actor_tgt.forward(slr2, stn2, pder2)
+        noise  = np.clip(np.random.normal(0, self.sig_p, a_next.shape),
+                         -self.r_p, self.r_p).astype(np.float32)
+        a_next = np.clip(a_next + noise, -1, 1)
+
+        # --- Target Q (Eq. 23) ---
+        q1_n = self.critic1_tgt.forward(slr2, stn2, pder2, a_next)
+        q2_n = self.critic2_tgt.forward(slr2, stn2, pder2, a_next)
+        y    = reward + self.gamma * np.minimum(q1_n, q2_n)
+
+        # --- Critic update (Eq. 24) ---
+        c1_loss = self.critic1.backward_critic(slr, stn, pder, action, y, self.lr_c)
+        c2_loss = self.critic2.backward_critic(slr, stn, pder, action, y, self.lr_c)
+
+        # --- Delayed actor update (Eq. 25) ---
+        a_loss = None
+        if self.t % self.f_p == 0:
+            a_pred  = self.actor.forward(slr, stn, pder)
+            q_val   = self.critic1.forward(slr, stn, pder, a_pred)
+            a_loss  = float(-q_val.mean())
+
+            # FIX 4: analytic ∂Q/∂a via chain rule (not finite differences)
+            grad_a  = self.critic1.grad_wrt_action(slr, stn, pder, a_pred)
+            # Policy gradient = -∂Q/∂a  (we want to ascend Q)
+            self.actor.backward(-grad_a * 1e-3, self.lr_a)
+
+            # Soft target updates (Eq. Algorithm 2, line 13)
+            self.actor_tgt.copy_from(self.actor, self.tau)
+            self.critic1_tgt.copy_from(self.critic1, self.tau)
+            self.critic2_tgt.copy_from(self.critic2, self.tau)
+
+        return (c1_loss + c2_loss) / 2, a_loss
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8: TRAINING LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train(n_episodes=200, steps_per_episode=36, warmup_steps=300):
+    print("=" * 65)
+    print("  GRA-TD3 — Delhi Metro Passenger Route Guidance")
+    print("=" * 65)
+
+    np.random.seed(42); random.seed(42)
+
+    # 1. Data
+    dl = DelhiMetroDataLoader("OD_Flow_Apr'23 (1).csv",'stationwise_hourly_entry_exit_february_2024.xlsx')
+
+    # 2. SDNE embeddings
+    sdne       = SDNE(dl.N, embed_dim=32, hidden=64,
+                      alpha=0.01, gamma=0.1, lr=0.005, epochs=60)
+    sdne_losses = sdne.fit(dl.od_matrix)
+    embeddings  = sdne.get_embeddings(dl.od_matrix)          # (N, 32)
+    print(f"[SDNE] Embeddings: {embeddings.shape}")
+
+    # 3. Environment + agent
+    env   = DelhiMetroEnv(dl, embeddings, omega=(1.0, 1.0, 1.0))
+    agent = GRATD3Agent(dl.N, embed_dim=32,
+                        lr_actor=3e-4, lr_critic=3e-4,
+                        gamma=0.99, tau=0.005,
+                        sigma_e=0.2, sigma_p=0.4, r_p=1.0, f_p=2,
+                        batch_size=32)
+
+    history = {'total': [], 'sec': [], 'util': [], 'emis': [],
+               'c_loss': [], 'a_loss': []}
+
+    print(f"\n[Train] {n_episodes} episodes × {steps_per_episode} steps "
+          f"(warmup {warmup_steps} steps)")
+
+    global_step = 0
+    for ep in range(1, n_episodes + 1):
+        slr, stn = env.reset()
+        pder     = env.get_pder()
+
+        ep_R = ep_sec = ep_util = ep_emis = 0.0
+        ep_cl = ep_al = 0.0
+        al_cnt = 0
+
+        for _ in range(steps_per_episode):
+            global_step += 1
+
+            if global_step < warmup_steps:
+                action = np.random.uniform(-1, 1, (1, dl.N)).astype(np.float32)
+            else:
+                action = agent.select_action(slr, stn, pder)
+
+            (reward, r_sec, r_util, r_emis), slr2, stn2 = env.step(action[0])
+            pder2 = env.get_pder()
+
+            agent.store(slr, stn, pder, action, reward, slr2, stn2, pder2)
+            c_loss, a_loss = agent.update()
+
+            ep_R    += reward;  ep_sec  += r_sec
+            ep_util += r_util;  ep_emis += r_emis
+            if c_loss is not None: ep_cl += c_loss
+            if a_loss is not None:
+                ep_al += a_loss; al_cnt += 1
+
+            slr, stn, pder = slr2, stn2, pder2
+
+        T = steps_per_episode
+        history['total'].append(ep_R  / T)
+        history['sec'].append(ep_sec  / T)
+        history['util'].append(ep_util / T)
+        history['emis'].append(ep_emis / T)
+        history['c_loss'].append(ep_cl  / T)
+        history['a_loss'].append(ep_al  / max(al_cnt, 1))
+
+        if ep % 10 == 0 or ep == 1:
+            print(f"  Ep {ep:3d}/{n_episodes}  R={ep_R/T:.3f}  "
+                  f"Sec={ep_sec/T:.3f}  Util={ep_util/T:.3f}  "
+                  f"Emis={ep_emis/T:.3f}  CLoss={ep_cl/T:.4f}")
+
+    print("[Train] Done.")
+    return agent, env, dl, embeddings, sdne_losses, history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9: EVALUATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate(agent, env, n_steps=36):
+    slr, stn = env.reset()
+    pder     = env.get_pder()
+    rows     = []
+    for _ in range(n_steps):
+        action = agent.select_action(slr, stn, pder, add_noise=False)
+        (reward, r_sec, r_util, r_emis), slr2, stn2 = env.step(action[0])
+        pder2  = env.get_pder()
+        rows.append({'reward': reward, 'sec': r_sec, 'util': r_util,
+                     'emis': r_emis,
+                     'avg_slr': float(env.slr.mean()),
+                     'max_slr': float(env.slr.max()),
+                     'action_mean': float(action.mean())})
+        slr, stn, pder = slr2, stn2, pder2
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10: VISUALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_plots(history, eval_df, dl, embeddings, sdne_losses, env):
+    from sklearn.decomposition import PCA
+
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig = plt.figure(figsize=(20, 26))
+    gs  = gridspec.GridSpec(5, 2, figure=fig, hspace=0.48, wspace=0.35)
+
+    eps = range(1, len(history['total']) + 1)
+
+    # 1 — Training reward curves
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(eps, history['total'], 'k-',  lw=2,   label='Total Reward')
+    ax1.plot(eps, history['sec'],   'b--', lw=1.5, label='SLR (congestion)')
+    ax1.plot(eps, history['util'],  'g--', lw=1.5, label='Passenger Utility')
+    ax1.plot(eps, history['emis'],  'r--', lw=1.5, label='Emission Reward')
+    ax1.set_title('Training Curves – GRA-TD3 (Delhi Metro)', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Episode'); ax1.set_ylabel('Reward')
+    ax1.legend(fontsize=10)
+
+    # 2 — Critic / Actor loss
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(eps, history['c_loss'], 'm-', lw=1.5)
+    ax2.set_title('Critic Loss', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Episode'); ax2.set_ylabel('MSE')
+
+    ax3 = fig.add_subplot(gs[1, 1])
+    ax3.plot(eps, history['a_loss'], color='darkorange', lw=1.5)
+    ax3.set_title('Actor Loss', fontsize=12, fontweight='bold')
+    ax3.set_xlabel('Episode'); ax3.set_ylabel('−Q')
+
+    # 3 — SDNE loss
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.plot(sdne_losses, color='teal', lw=2)
+    ax4.set_title('SDNE Embedding Training Loss', fontsize=12, fontweight='bold')
+    ax4.set_xlabel('Epoch'); ax4.set_ylabel('Loss')
+
+    # 4 — SDNE embedding PCA
+    ax5 = fig.add_subplot(gs[2, 1])
+    pca   = PCA(n_components=2)
+    emb2d = pca.fit_transform(embeddings)
+    peak_entry = dl.entry_peak.reindex(dl.stations).fillna(0).values
+    sc = ax5.scatter(emb2d[:, 0], emb2d[:, 1],
+                     c=peak_entry, cmap='YlOrRd', s=15, alpha=0.7)
+    plt.colorbar(sc, ax=ax5, label='Peak Entry Passengers')
+    ax5.set_title('SDNE Station Embeddings (PCA, coloured by peak entry)',
+                  fontsize=11, fontweight='bold')
+    ax5.set_xlabel('PC 1'); ax5.set_ylabel('PC 2')
+
+    # 5 — Eval: SLR trajectory
+    steps = range(len(eval_df))
+    ax6 = fig.add_subplot(gs[3, 0])
+    ax6.plot(steps, eval_df['avg_slr'], 'b-',  lw=2,   label='Mean SLR')
+    ax6.plot(steps, eval_df['max_slr'], 'r--', lw=1.5, label='Max SLR')
+    ax6.axhline(0.6, color='orange', ls=':', label='Mid-congested (0.6)')
+    ax6.axhline(0.8, color='red',    ls=':', label='Over-congested (0.8)')
+    ax6.set_title('SLR Trajectory – Guided Evaluation (3 h)', fontsize=12, fontweight='bold')
+    ax6.set_xlabel('Time step (5-min)'); ax6.set_ylabel('SLR')
+    ax6.set_ylim(0, 1.05); ax6.legend(fontsize=9)
+
+    # 6 — Eval: reward breakdown
+    ax7 = fig.add_subplot(gs[3, 1])
+    ax7.plot(steps, eval_df['reward'], 'k-',  lw=2,   label='Total')
+    ax7.plot(steps, eval_df['sec'],    'b--', lw=1.5, label='Congestion')
+    ax7.plot(steps, eval_df['util'],   'g--', lw=1.5, label='Utility')
+    ax7.plot(steps, eval_df['emis'],   'r--', lw=1.5, label='Emission')
+    ax7.set_title('Per-Step Reward Breakdown – Evaluation', fontsize=12, fontweight='bold')
+    ax7.set_xlabel('Time step'); ax7.set_ylabel('Reward')
+    ax7.legend(fontsize=9)
+
+    # 7 — Top 20 congested stations
+    ax8 = fig.add_subplot(gs[4, :])
+    slr_series = pd.Series(env.slr, index=dl.stations)
+    top20  = slr_series.nlargest(20)
+    colors = ['crimson' if v > 0.8 else 'darkorange' if v > 0.6
+              else 'steelblue' for v in top20.values]
+    ax8.bar(range(len(top20)), top20.values, color=colors)
+    ax8.set_xticks(range(len(top20)))
+    ax8.set_xticklabels(top20.index, rotation=45, ha='right', fontsize=9)
+    ax8.axhline(0.8, color='red',    ls='--', lw=1, label='Over-congested >0.8')
+    ax8.axhline(0.6, color='orange', ls='--', lw=1, label='Mid-congested >0.6')
+    ax8.set_title('Top 20 Stations by SLR (Post-Guidance)', fontsize=12, fontweight='bold')
+    ax8.set_ylabel('SLR'); ax8.legend(fontsize=9)
+    ax8.set_ylim(0, 1.05)
+
+    plt.suptitle('GRA-TD3: Dynamic Passenger Route Guidance – Delhi Metro\n'
+                 '(Hao et al., IEEE T-ITS 2024 – Corrected Implementation)',
+                 fontsize=15, fontweight='bold', y=1.01)
+
+    out_path = 'gra_td3_results.png'
+    plt.savefig(out_path, dpi=130, bbox_inches='tight')
+    print(f"[Plot] Saved → {out_path}")
+    return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11: SUMMARY REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_summary(history, eval_df, dl, env):
+    print("\n" + "=" * 65)
+    print("  RESULTS SUMMARY")
+    print("=" * 65)
+    s = slice(-10, None)
+    print(f"\n Training (last 10 eps avg):")
+    print(f"   Total Reward : {np.mean(history['total'][s]):.4f}")
+    print(f"   SLR Reward   : {np.mean(history['sec'][s]):.4f}")
+    print(f"   Utility Rwd  : {np.mean(history['util'][s]):.4f}")
+    print(f"   Emission Rwd : {np.mean(history['emis'][s]):.4f}")
+    print(f"\n Evaluation (greedy, 36 steps = 3 h):")
+    print(f"   Avg SLR      : {eval_df['avg_slr'].mean():.4f}")
+    print(f"   Max SLR      : {eval_df['max_slr'].mean():.4f}")
+    print(f"   Total Reward : {eval_df['reward'].mean():.4f}")
+    slr_s = pd.Series(env.slr, index=dl.stations)
+    n_o = (slr_s > 0.8).sum()
+    n_m = ((slr_s > 0.6) & (slr_s <= 0.8)).sum()
+    n_u = (slr_s <= 0.6).sum()
+    print(f"\n Final Network SLR Classification:")
+    print(f"   Over-congested (>0.8) : {n_o}")
+    print(f"   Mid-congested  (>0.6) : {n_m}")
+    print(f"   Uncongested   (≤0.6)  : {n_u}")
+    print(f"\n Top-5 most congested stations:")
+    for stn, val in slr_s.nlargest(5).items():
+        tag = "RED" if val > 0.8 else "ORANGE"
+        print(f"   [{tag}] {stn} : SLR={val:.3f}")
+    print("=" * 65)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    agent, env, dl, embeddings, sdne_losses, history = train(
+        n_episodes=200,
+        steps_per_episode=36,
+        warmup_steps=300)
+
+    eval_df = evaluate(agent, env, n_steps=36)
+    print_summary(history, eval_df, dl, env)
+    make_plots(history, eval_df, dl, embeddings, sdne_losses, env)
+    print("\n[Done] All outputs saved.")
