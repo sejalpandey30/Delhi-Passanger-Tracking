@@ -1,0 +1,814 @@
+
+MATD3: Multi-Agent Twin Delayed Deep Deterministic Policy Gradient
+for Delhi Metro Passenger Route Guidance.
+
+Multi-agent reformulation of:
+  Hao et al., "Dynamic Passenger Route Guidance in the Multimodal Transit
+  System With Graph Representation and Attention Based Deep Reinforcement
+  Learning", IEEE T-ITS 2024
+
+DESIGN (per user's choices):
+  - Agents       : one per station (257 agents)
+  - Parameters   : SHARED actor network (same weights, different local obs)
+                   -> "parameter-sharing MATD3", standard for homogeneous
+                      agents in large-scale MARL (Lowe et al. MADDPG extended
+                      to TD3-style twin critics + smoothing).
+  - Reward       : single shared GLOBAL reward (Eq. 18 of the paper),
+                   broadcast identically to every agent (fully cooperative).
+  - Critics      : CENTRALIZED — see the full joint state (all stations'
+                   SLR + waiting + global PDER) and the full joint action
+                   (all 257 recommendation degrees), output ONE global Q.
+                   This is the standard CTDE (centralized training,
+                   decentralized execution) pattern: at execution time each
+                   agent only needs its own local observation to act.
+
+Each agent's LOCAL observation = [own SLR, own waiting (norm.), mean SLR of
+1-hop neighbours, mean waiting of 1-hop neighbours, own PDER-weighted demand
+scalar] -> a small fixed-size vector, fed through the SHARED actor to
+produce that agent's own recommendation degree in [-1, 1].
+
+The CENTRAL critic takes the concatenation of all 257 local observations
+plus all 257 actions (the joint state/action) and predicts the single
+shared Q-value — this lets the policy gradient for any one agent account
+for system-wide consequences, matching the paper's "weighted summation
+SLR" congestion objective which is inherently global.
+"""
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from collections import deque
+import random, os, warnings
+warnings.filterwarnings("ignore")
+
+np.random.seed(42); random.seed(42)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. DATA LOADING  (same as centralized version)
+# ─────────────────────────────────────────────────────────────────────────────
+class DelhiMetroDataLoader:
+    PEAK_HOURS = ['HR7', 'HR8', 'HR9', 'HR10']
+
+    def __init__(self, od_path, xlsx_path):
+        print("[Data] Loading OD matrix ...")
+        self.od_df = pd.read_csv(od_path)
+        self.stations = list(self.od_df['Stn.'])
+        self.station_idx = {s: i for i, s in enumerate(self.stations)}
+        self.N = len(self.stations)
+        raw = self.od_df.set_index('Stn.').reindex(
+            columns=self.stations).fillna(0).values.astype(np.float32)
+        np.fill_diagonal(raw, 0)
+        self.od_matrix_raw = raw
+        print(f"  OD {self.N}x{self.N}, raw total flow={raw.sum():.0f}")
+
+        print("[Data] Loading peak-hour entry/exit ...")
+        self.entry_peak, self.exit_peak = self._load_peak(xlsx_path)
+
+        # The OD CSV is a long-period aggregate (e.g. full month) and is ~100x
+        # larger than a realistic single morning-peak (3h) volume. Rescale the
+        # OD matrix so its total flow matches the actual measured peak-hour
+        # entry volume from the hourly dataset -- this keeps routing decisions
+        # operating on a physically sensible passenger-count scale relative to
+        # real per-train capacities (~2000-2400 pax/train).
+        target_total = float(self.entry_peak.sum())
+        scale = target_total / (raw.sum() + 1e-9)
+        self.od_matrix = raw * scale
+        print(f"  Rescaled OD to peak-hour scale: total={self.od_matrix.sum():.0f} "
+              f"(scale factor={scale:.5f})")
+
+        print("[Data] Building network ...")
+        self.line_df = pd.read_excel(xlsx_path, sheet_name='Index')
+        self.G = self._build_graph()
+        print(f"  Graph: {self.G.number_of_nodes()} nodes, "
+              f"{self.G.number_of_edges()//2} edges")
+
+        # Pre-compute 1-hop neighbour index lists (used for local obs)
+        self.neighbors = {}
+        for s in self.stations:
+            if s in self.G:
+                nbrs = [self.station_idx[n] for n in self.G.successors(s)
+                        if n in self.station_idx]
+            else:
+                nbrs = []
+            self.neighbors[self.station_idx[s]] = nbrs
+
+    def _load_peak(self, path):
+        e = pd.read_excel(path, sheet_name='february_2025_entry')
+        x = pd.read_excel(path, sheet_name='february_2025_exit')
+        ep = e.groupby('station code')[self.PEAK_HOURS].mean().sum(axis=1)
+        xp = x.groupby('station code')[self.PEAK_HOURS].mean().sum(axis=1)
+        return ep, xp
+
+    def _build_graph(self):
+        G = nx.DiGraph()
+        for code in self.stations:
+            G.add_node(code, entry=float(self.entry_peak.get(code, 0)),
+                       exit=float(self.exit_peak.get(code, 0)),
+                       idx=self.station_idx[code])
+        for line, grp in self.line_df.groupby('linename', sort=False):
+            codes = list(grp['station code'])
+            for i in range(len(codes) - 1):
+                u, v = codes[i], codes[i+1]
+                if u not in self.station_idx or v not in self.station_idx:
+                    continue
+                ui, vi = self.station_idx[u], self.station_idx[v]
+                flow = max(1., float(self.od_matrix[ui, vi] + self.od_matrix[vi, ui]))
+                G.add_edge(u, v, weight=flow, line=line, capacity=2400.)
+                G.add_edge(v, u, weight=flow, line=line, capacity=2400.)
+        name2codes = {}
+        for _, row in self.line_df.iterrows():
+            name2codes.setdefault(row['station name'], []).append(row['station code'])
+        for name, codes in name2codes.items():
+            cs = [c for c in codes if c in self.station_idx]
+            for i in range(len(cs)):
+                for j in range(i + 1, len(cs)):
+                    G.add_edge(cs[i], cs[j], weight=0.5, line='XFER', capacity=2400.)
+                    G.add_edge(cs[j], cs[i], weight=0.5, line='XFER', capacity=2400.)
+        return G
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. SDNE — unchanged (used to build PDER scalar per station)
+# ─────────────────────────────────────────────────────────────────────────────
+class SDNE:
+    def __init__(self, n, embed=32, hidden=64, alpha=0.01, gamma=0.1, lr=0.005, epochs=60):
+        self.n = n; self.d = embed; self.alpha = alpha; self.gamma = gamma
+        self.lr = lr; self.epochs = epochs
+        s1 = np.sqrt(2. / (n + hidden)); s2 = np.sqrt(2. / (hidden + embed))
+        self.W1 = np.random.randn(n, hidden).astype(np.float32) * s1
+        self.b1 = np.zeros(hidden, dtype=np.float32)
+        self.W2 = np.random.randn(hidden, embed).astype(np.float32) * s2
+        self.b2 = np.zeros(embed, dtype=np.float32)
+
+    @staticmethod
+    def _r(x): return np.maximum(0, x)
+    @staticmethod
+    def _dr(x): return (x > 0).astype(np.float32)
+
+    def fit(self, adj):
+        rs = adj.sum(1, keepdims=True); rs[rs == 0] = 1
+        X = (adj / rs).astype(np.float32)
+        B = np.where(X > 0, 10., 1.).astype(np.float32)
+        D = np.diag(X.sum(1)); Lap = D - X
+        losses = []
+        print(f"[SDNE] Training {self.epochs} epochs ...")
+        for ep in range(self.epochs):
+            H1 = self._r(X @ self.W1 + self.b1)
+            Y = self._r(H1 @ self.W2 + self.b2)
+            H1d = self._r(Y @ self.W2.T + self.b1)
+            Xh = self._r(H1d @ self.W1.T)
+            diff = (Xh - X) * B
+            L2 = 0.5 * float(np.mean(diff ** 2))
+            L1 = self.alpha * float(np.trace(Y.T @ Lap @ Y)) / self.n
+            Lr = self.gamma * float(np.sum(self.W1 ** 2) + np.sum(self.W2 ** 2))
+            loss = L2 + L1 + Lr; losses.append(loss)
+            nb = len(X)
+            dXh = (diff * B) / nb
+            dXhz = dXh * self._dr(H1d @ self.W1.T)
+            dW1_dec = (H1d.T @ dXhz).T
+            dH1d = dXhz @ self.W1
+            dH1dz = dH1d * self._dr(Y @ self.W2.T + self.b1)
+            dW2_dec = Y.T @ dH1dz; db1d = dH1dz.mean(0)
+            dY_dec = dH1dz @ self.W2
+            dY_lap = (2 * self.alpha / self.n) * (Lap @ Y)
+            dY = dY_dec + dY_lap
+            dYz = dY * self._dr(H1 @ self.W2 + self.b2)
+            dW2_enc = H1.T @ dYz; db2 = dYz.mean(0)
+            dH1 = dYz @ self.W2.T
+            dH1z = dH1 * self._dr(X @ self.W1 + self.b1)
+            dW1_enc = X.T @ dH1z; db1e = dH1z.mean(0)
+            dW1 = dW1_enc + dW1_dec + 2 * self.gamma * self.W1
+            dW2 = dW2_enc + dW2_dec.T + 2 * self.gamma * self.W2
+            self.W1 -= self.lr * np.clip(dW1, -1, 1)
+            self.W2 -= self.lr * np.clip(dW2, -1, 1)
+            self.b1 -= self.lr * (db1e + db1d)
+            self.b2 -= self.lr * db2
+            if (ep + 1) % 20 == 0:
+                print(f"  epoch {ep+1}/{self.epochs} loss={loss:.5f}")
+        print(f"[SDNE] Final loss={losses[-1]:.5f}")
+        return losses
+
+    def embed(self, adj):
+        rs = adj.sum(1, keepdims=True); rs[rs == 0] = 1
+        X = (adj / rs).astype(np.float32)
+        H1 = self._r(X @ self.W1 + self.b1)
+        return self._r(H1 @ self.W2 + self.b2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. BASIC LAYERS
+# ─────────────────────────────────────────────────────────────────────────────
+def glorot(shape):
+    fan = sum(shape[:2]) if len(shape) >= 2 else shape[0]
+    return np.random.randn(*shape).astype(np.float32) * np.sqrt(2. / fan)
+
+class Dense:
+    def __init__(self, i, o, act='relu'):
+        self.W = glorot((i, o)); self.b = np.zeros(o, np.float32)
+        self.act = act; self.x = self.z = None
+    def fwd(self, x):
+        self.x = x; self.z = x @ self.W + self.b
+        if self.act == 'relu': return np.maximum(0, self.z)
+        if self.act == 'tanh': return np.tanh(self.z)
+        return self.z
+    def bwd(self, dout, lr):
+        dz = (dout * (self.z > 0) if self.act == 'relu' else
+              dout * (1 - np.tanh(self.z) ** 2) if self.act == 'tanh' else dout)
+        self.W -= lr * np.clip(self.x.T @ dz, -1, 1)
+        self.b -= lr * np.clip(dz.mean(0), -1, 1)
+        return dz @ self.W.T
+    def copy(self, o, tau=1.):
+        self.W = tau * o.W + (1 - tau) * self.W
+        self.b = tau * o.b + (1 - tau) * self.b
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. SHARED ACTOR — one small network, used by ALL 257 station-agents
+# ─────────────────────────────────────────────────────────────────────────────
+class SharedActor:
+    """
+    Local observation per agent (station i):
+        [ own_SLR, own_waiting_norm, neighbor_mean_SLR,
+          neighbor_mean_waiting_norm, own_PDER_scalar ]   -> dim = 5
+
+    Output: own recommendation degree in [-1, 1] (tanh).
+
+    Because the SAME weights are applied to every station's local
+    observation (batched as one big (n_agents*batch, 5) matrix), this
+    is "parameter sharing" — standard for homogeneous multi-agent RL
+    with large/variable agent counts (avoids 257 independent networks
+    while each agent still acts on its own local information).
+    """
+    OBS_DIM = 5
+
+    def __init__(self, hidden=32):
+        self.f1 = Dense(self.OBS_DIM, hidden, 'relu')
+        self.f2 = Dense(hidden, hidden, 'relu')
+        self.f3 = Dense(hidden, 1, 'tanh')
+
+    def fwd(self, obs):
+        """obs: (B, OBS_DIM) -> (B, 1) recommendation degree."""
+        return self.f3.fwd(self.f2.fwd(self.f1.fwd(obs)))
+
+    def bwd(self, dout, lr):
+        d = self.f3.bwd(dout, lr)
+        d = self.f2.bwd(d, lr)
+        self.f1.bwd(d, lr)
+
+    def layers(self): return [self.f1, self.f2, self.f3]
+    def copy(self, o, tau=1.):
+        for a, b in zip(self.layers(), o.layers()): a.copy(b, tau)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. CENTRALIZED CRITIC — sees JOINT state + JOINT action, outputs global Q
+# ─────────────────────────────────────────────────────────────────────────────
+class CentralCritic:
+    """
+    Input : concat(all local obs for N agents, all N actions)
+            shape = N * OBS_DIM + N
+    Output: single global Q-value (shared by all agents — CTDE).
+    """
+    def __init__(self, n_agents, obs_dim=5, hidden=256):
+        in_dim = n_agents * obs_dim + n_agents
+        self.f1 = Dense(in_dim, hidden, 'relu')
+        self.f2 = Dense(hidden, hidden, 'relu')
+        self.f3 = Dense(hidden, 1, 'linear')
+
+    def fwd(self, joint_obs, joint_act):
+        x = np.concatenate([joint_obs, joint_act], axis=-1)
+        return self.f3.fwd(self.f2.fwd(self.f1.fwd(x))).squeeze(-1)
+
+    def bwd_critic(self, joint_obs, joint_act, target_q, lr):
+        x = np.concatenate([joint_obs, joint_act], axis=-1)
+        h1 = self.f1.fwd(x); h2 = self.f2.fwd(h1)
+        q = self.f3.fwd(h2).squeeze(-1)
+        err = q - target_q
+        loss = float(np.mean(err ** 2))
+        dq = (2 * err / len(err))[:, None]
+        dh2 = self.f3.bwd(dq, lr)
+        dh1 = self.f2.bwd(dh2, lr)
+        self.f1.bwd(dh1, lr)
+        return loss
+
+    def grad_wrt_joint_action(self, joint_obs, joint_act):
+        """Analytic dQ/d(joint_act) via chain rule — used for actor update."""
+        x = np.concatenate([joint_obs, joint_act], axis=-1)
+        h1 = self.f1.fwd(x); h2 = self.f2.fwd(h1); q = self.f3.fwd(h2)
+        dq = np.ones_like(q)
+        dh2 = dq @ self.f3.W.T
+        dh2z = dh2 * (h2 > 0)
+        dh1 = dh2z @ self.f2.W.T
+        dh1z = dh1 * (h1 > 0)
+        dx = dh1z @ self.f1.W.T
+        n_act = joint_act.shape[-1]
+        return dx[:, -n_act:]               # dQ / d(joint_act), shape (B, N)
+
+    def layers(self): return [self.f1, self.f2, self.f3]
+    def copy(self, o, tau=1.):
+        for a, b in zip(self.layers(), o.layers()): a.copy(b, tau)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. REPLAY BUFFER (stores joint transitions)
+# ─────────────────────────────────────────────────────────────────────────────
+class ReplayBuffer:
+    def __init__(self, cap=20000):
+        self.buf = deque(maxlen=cap)
+    def push(self, *t):
+        self.buf.append(t)
+    def sample(self, n):
+        batch = random.sample(self.buf, n)
+        jo, ja, r, jo2 = zip(*batch)
+        return (np.vstack(jo).astype(np.float32),
+                np.vstack(ja).astype(np.float32),
+                np.array(r, np.float32),
+                np.vstack(jo2).astype(np.float32))
+    def __len__(self): return len(self.buf)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. MULTI-AGENT ENVIRONMENT
+#    Builds the per-agent local observation vectors + the same global
+#    reward mechanics (route guidance + Eq.18 reward) as the centralized
+#    version, but now exposes the JOINT local-obs matrix instead of two
+#    flat (1,N) state vectors.
+# ─────────────────────────────────────────────────────────────────────────────
+class MultiAgentMetroEnv:
+    CAP = 150; ME = 10.7; BE = 13.14
+    TH = np.array([-1.65, -0.0339, -0.284])
+    K = 3; MIN_FLOW = 0.3; DIST = 11.
+
+    def __init__(self, dl, embeddings, omega=(1, 1, 1)):
+        self.dl = dl; self.emb = embeddings; self.N = dl.N; self.G = dl.G
+        self.ws, self.wu, self.we = omega
+        self.be = np.array([float(dl.entry_peak.get(s, 0)) for s in dl.stations], np.float32)
+
+        print("[Env] Edge betweenness ...")
+        bc = nx.edge_betweenness_centrality(self.G, weight='weight', normalized=True)
+        mx = max(bc.values()) if bc else 1.
+        self.sw = {(u, v): v2 / (mx + 1e-9) for (u, v), v2 in bc.items()}
+
+        print("[Env] Pre-computing routes ...")
+        self._prep_routes()
+        print(f"  {len(self.routes)} O-D pairs")
+
+        # Per-station PDER scalar (project SDNE embedding -> 1 scalar via demand weight)
+        row_demand = dl.od_matrix.sum(1)
+        self.pder_scalar = row_demand / (row_demand.max() + 1e-9)   # (N,) in [0,1]
+
+        ne = self.G.number_of_edges()
+        self.max_sec = float(ne); self.min_sec = 0.
+        self._reset()
+        print("[Env] Ready.")
+
+    def _prep_routes(self):
+        od = self.dl.od_matrix; idx = self.dl.station_idx; stns = self.dl.stations
+        self.routes = {}
+        pairs = list(zip(*np.where(od > self.MIN_FLOW)))
+        if len(pairs) > 500:
+            rng = np.random.default_rng(42)
+            pairs = [pairs[k] for k in rng.choice(len(pairs), 500, replace=False)]
+        for i, j in pairs:
+            s, d = stns[i], stns[j]
+            if s not in self.G or d not in self.G or s == d:
+                continue
+            try:
+                paths = []
+                gen = nx.shortest_simple_paths(self.G, s, d, weight='weight')
+                for _ in range(self.K):
+                    p = next(gen)
+                    paths.append([idx[n] for n in p if n in idx])
+                self.routes[(i, j)] = paths
+            except Exception:
+                pass
+
+    def _reset(self):
+        self.eload = {e: 0. for e in self.G.edges()}
+        od = self.dl.od_matrix; stns = self.dl.stations
+        for (i, j), paths in self.routes.items():
+            flow = od[i, j] / max(len(paths), 1)
+            for path in paths:
+                for k in range(len(path) - 1):
+                    u, v = stns[path[k]], stns[path[k + 1]]
+                    if self.G.has_edge(u, v):
+                        self.eload[(u, v)] = self.eload.get((u, v), 0.) + flow
+        self.waiting = self.be * 0.15
+        self._slr()
+
+    def _slr(self):
+        ss = np.zeros(self.N, np.float32); sc = np.zeros(self.N, np.float32)
+        for (u, v), load in self.eload.items():
+            ui = self.dl.station_idx.get(u, -1); vi = self.dl.station_idx.get(v, -1)
+            if ui < 0 or vi < 0:
+                continue
+            cap = self.CAP
+            r = min(1., load / (cap + 1e-9))
+            ss[ui] += r; sc[ui] += 1; ss[vi] += r; sc[vi] += 1
+        sc[sc == 0] = 1
+        self.slr = np.clip(ss / sc, 0, 1).astype(np.float32)
+
+    def get_joint_obs(self):
+        """
+        Build the (N, OBS_DIM) matrix of LOCAL observations, one row per
+        station-agent:
+          [own_SLR, own_waiting_norm, nbr_mean_SLR, nbr_mean_waiting_norm, own_PDER]
+        """
+        max_w = self.waiting.max() + 1e-9
+        wait_norm = self.waiting / max_w
+
+        nbr_slr = np.zeros(self.N, np.float32)
+        nbr_wait = np.zeros(self.N, np.float32)
+        for i in range(self.N):
+            nbrs = self.dl.neighbors.get(i, [])
+            if nbrs:
+                nbr_slr[i] = self.slr[nbrs].mean()
+                nbr_wait[i] = wait_norm[nbrs].mean()
+            else:
+                nbr_slr[i] = self.slr[i]
+                nbr_wait[i] = wait_norm[i]
+
+        obs = np.stack([self.slr, wait_norm, nbr_slr, nbr_wait,
+                        self.pder_scalar], axis=-1).astype(np.float32)  # (N, 5)
+        return obs
+
+    def step(self, joint_action):
+        """
+        joint_action: (N,) recommendation degree per station-agent.
+        Route selection + reward computation identical to the paper's
+        mechanism but action now comes from N independent (shared-weight)
+        agents instead of one centralized actor.
+        """
+        for k in self.eload:
+            self.eload[k] = 0.
+        od = self.dl.od_matrix; stns = self.dl.stations
+
+        total_hops = 0.0
+        total_xfers = 0.0
+        total_flow_routed = 0.0
+
+        for (i, j), paths in self.routes.items():
+            flow = od[i, j]
+            if flow <= 0 or not paths:
+                continue
+            scores = [float(joint_action[p].sum()) for p in paths]
+            best = paths[int(np.argmax(scores))]
+            for k in range(len(best) - 1):
+                u, v = stns[best[k]], stns[best[k + 1]]
+                if self.G.has_edge(u, v):
+                    self.eload[(u, v)] = self.eload.get((u, v), 0.) + flow
+
+            # Track route quality stats, weighted by flow on this O-D pair
+            n_hops = len(best) - 1
+            n_xfer = sum(1 for k in range(len(best) - 1)
+                        if self.G.has_edge(stns[best[k]], stns[best[k+1]])
+                        and self.G[stns[best[k]]][stns[best[k+1]]].get('line') == 'XFER')
+            total_hops += n_hops * flow
+            total_xfers += n_xfer * flow
+            total_flow_routed += flow
+
+        self._avg_hops = total_hops / max(total_flow_routed, 1.0)
+        self._avg_xfers = total_xfers / max(total_flow_routed, 1.0)
+
+        self.waiting = self.be * (0.10 + 0.25 * self.slr)
+        self._slr()
+        reward = self._reward(joint_action)
+        return reward, self.get_joint_obs()
+
+    def _reward(self, action):
+        """Global Eq.18 reward — SHARED identically across all agents.
+        R_util now responds to the agents' actual routing choices
+        (avg hops + transfers of the routes selected this step), so
+        the multi-agent policy gets a real learning signal instead of
+        only depending on a near-invariant global SLR scalar."""
+        eps = sum(self.sw.get((u, v), 0.5) * float(self.slr[self.dl.station_idx[u]])
+                  for u, v in self.G.edges() if u in self.dl.station_idx)
+        Rs = float(np.clip((self.max_sec - eps) / (self.max_sec - self.min_sec + 1e-9), 0, 1))
+
+        avg = float(self.slr.mean())
+        avg_hops = getattr(self, '_avg_hops', 5.0)
+        avg_xfers = getattr(self, '_avg_xfers', 1.0)
+        tt = 0.05 * avg_hops + avg * 0.5       # more hops / congestion -> longer travel time
+        wt = avg * 0.25
+        nt = avg_xfers
+        tc = 20. + avg_hops * 1.0               # more hops -> higher fare proxy
+        u = self.TH[0] * (tt + wt) + self.TH[1] * nt + self.TH[2] * tc
+        # Empirical range observed in this network: ~15-45 hops, 0-6 transfers, SLR 0-1
+        mu = self.TH[0] * (0.05 * 15 + 0.0) + self.TH[1] * 0 + self.TH[2] * (20 + 15)
+        nu = self.TH[0] * (0.05 * 45 + 0.5) + self.TH[1] * 6 + self.TH[2] * (20 + 45)
+        Ru = float(np.clip((u - nu) / (mu - nu + 1e-9), 0, 1))
+
+        tf = sum(self.eload.values())
+        em = tf * self.ME * self.DIST
+        bs = float(np.maximum(0, -action).mean()) * 0.1
+        em += bs * tf * self.BE * self.DIST
+        me = tf * self.BE * self.DIST * 1.2
+        ne2 = tf * self.ME * self.DIST * 0.8
+        Re = float(np.clip((me - em) / (me - ne2 + 1e-9), 0, 1))
+
+        R = self.ws * Rs + self.wu * Ru + self.we * Re
+        return float(R), float(Rs), float(Ru), float(Re)
+
+    def reset(self):
+        self._reset()
+        return self.get_joint_obs()
+
+    def co2(self):
+        tf = sum(self.eload.values())
+        return tf * self.ME * self.DIST, tf * self.BE * self.DIST * 0.05
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. MATD3 AGENT — shared actor + twin centralized critics
+# ─────────────────────────────────────────────────────────────────────────────
+class MATD3:
+    """
+    Multi-Agent TD3 (parameter-sharing, CTDE):
+
+      - ONE shared actor network π_φ used by every agent: each agent feeds
+        its own local obs (5-dim) through π_φ and gets its own scalar
+        action. Executed independently at runtime — this is the
+        "decentralized execution" half of CTDE.
+
+      - TWO centralized critics Q_ψ1, Q_ψ2 (+ matching targets), each
+        seeing the FULL joint observation (N x 5 flattened) and FULL joint
+        action (N,) to output ONE shared Q-value — the
+        "centralized training" half of CTDE, exactly mirroring TD3's twin
+        critics + delayed policy update + target-policy smoothing, but at
+        the joint level instead of single-agent level.
+
+      - The actor's policy gradient for EVERY agent's action dimension is
+        obtained from a single backward pass through the joint critic
+        (dQ/d(joint_action)), then we update the shared actor using the
+        per-agent (obs, dQ/da) pairs stacked into one big batch -- this
+        means the shared actor learns from all 257 agents' experiences
+        simultaneously every update.
+    """
+    def __init__(self, n_agents, obs_dim=5,
+                 lr_actor=3e-4, lr_critic=3e-4,
+                 gamma=0.99, tau=0.005,
+                 sigma_e=0.2, sigma_p=0.4, r_p=1.0, f_p=2,
+                 batch_size=32):
+        self.N = n_agents; self.obs_dim = obs_dim
+        self.lr_a = lr_actor; self.lr_c = lr_critic
+        self.gamma = gamma; self.tau = tau
+        self.sig_e = sigma_e; self.sig_p = sigma_p; self.r_p = r_p; self.f_p = f_p
+        self.bs = batch_size
+
+        self.actor = SharedActor()
+        self.actor_tgt = SharedActor(); self.actor_tgt.copy(self.actor)
+
+        self.c1 = CentralCritic(n_agents, obs_dim)
+        self.c1t = CentralCritic(n_agents, obs_dim); self.c1t.copy(self.c1)
+        self.c2 = CentralCritic(n_agents, obs_dim)
+        self.c2t = CentralCritic(n_agents, obs_dim); self.c2t.copy(self.c2)
+
+        self.buf = ReplayBuffer()
+        self.t = 0
+
+    def act(self, joint_obs, noise=True):
+        """
+        joint_obs: (N, obs_dim) — each row is one agent's local obs.
+        Shared actor processes ALL N rows in one batched forward pass
+        (this is exactly parameter sharing: same weights, N different
+        inputs -> N different outputs, decentralized execution).
+        """
+        a = self.actor.fwd(joint_obs).squeeze(-1)     # (N,)
+        if noise:
+            a = np.clip(a + np.random.normal(0, self.sig_e, a.shape), -1, 1)
+        return a.astype(np.float32)
+
+    def store(self, joint_obs, joint_act, reward, joint_obs2):
+        self.buf.push(joint_obs.flatten(), joint_act, reward, joint_obs2.flatten())
+
+    def update(self):
+        if len(self.buf) < self.bs:
+            return None, None
+        self.t += 1
+        jo, ja, r, jo2 = self.buf.sample(self.bs)        # jo: (B, N*obs_dim)
+
+        # --- target action for every agent (apply shared actor per-agent) ---
+        jo2_r = jo2.reshape(self.bs * self.N, self.obs_dim)
+        an2 = self.actor_tgt.fwd(jo2_r).reshape(self.bs, self.N)
+        noise = np.clip(np.random.normal(0, self.sig_p, an2.shape),
+                        -self.r_p, self.r_p).astype(np.float32)
+        an2 = np.clip(an2 + noise, -1, 1)
+
+        # --- centralized target Q ---
+        q1n = self.c1t.fwd(jo2, an2); q2n = self.c2t.fwd(jo2, an2)
+        y = r + self.gamma * np.minimum(q1n, q2n)
+
+        # --- critic update (joint, exactly like single-agent TD3 but on joint vecs) ---
+        cl1 = self.c1.bwd_critic(jo, ja, y, self.lr_c)
+        cl2 = self.c2.bwd_critic(jo, ja, y, self.lr_c)
+
+        al = None
+        if self.t % self.f_p == 0:
+            jo_r = jo.reshape(self.bs * self.N, self.obs_dim)
+            ap = self.actor.fwd(jo_r).reshape(self.bs, self.N)   # (B, N) joint pred action
+            qv = self.c1.fwd(jo, ap)
+            al = float(-qv.mean())
+
+            # dQ/d(joint_action) from centralized critic -> per-agent gradient
+            grad_joint = self.c1.grad_wrt_joint_action(jo, ap)   # (B, N)
+
+            # Reshape so every agent's (obs, dQ/da) becomes one training
+            # example for the SHARED actor -> (B*N, obs_dim) & (B*N, 1)
+            grad_flat = grad_joint.reshape(self.bs * self.N, 1)
+            self.actor.bwd(-grad_flat * 1e-3, self.lr_a)
+
+            self.actor_tgt.copy(self.actor, self.tau)
+            self.c1t.copy(self.c1, self.tau); self.c2t.copy(self.c2, self.tau)
+
+        return (cl1 + cl2) / 2, al
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. TRAINING LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+def train_matd3(env, dl, n_ep=200, steps=36, warmup=300):
+    agent = MATD3(dl.N, obs_dim=5, batch_size=32)
+    hist = {'tot': [], 'sec': [], 'util': [], 'emis': [], 'cl': [], 'al': []}
+    gs = 0
+    print(f"\n[Train] MATD3 (257 weight-shared agents): {n_ep} ep x {steps} steps")
+    for ep in range(1, n_ep + 1):
+        jo = env.reset()
+        eR = es = eu = ee = ec = ea = 0.; ac = 0
+        for _ in range(steps):
+            gs += 1
+            if gs < warmup:
+                a = np.random.uniform(-1, 1, dl.N).astype(np.float32)
+            else:
+                a = agent.act(jo)
+            (r, rs, ru, re), jo2 = env.step(a)
+            agent.store(jo, a, r, jo2)
+            cl, al = agent.update()
+            eR += r; es += rs; eu += ru; ee += re
+            if cl is not None: ec += cl
+            if al is not None: ea += al; ac += 1
+            jo = jo2
+        T = steps
+        hist['tot'].append(eR / T); hist['sec'].append(es / T)
+        hist['util'].append(eu / T); hist['emis'].append(ee / T)
+        hist['cl'].append(ec / T); hist['al'].append(ea / max(ac, 1))
+        if ep % 10 == 0 or ep == 1:
+            print(f"  Ep{ep:3d} R={eR/T:.3f} Sec={es/T:.3f} "
+                  f"Util={eu/T:.3f} Emis={ee/T:.3f}")
+    return agent, hist
+
+
+def evaluate_matd3(agent, env, n=36):
+    jo = env.reset(); rows = []
+    for _ in range(n):
+        a = agent.act(jo, noise=False)
+        (r, rs, ru, re), jo2 = env.step(a)
+        rows.append({'reward': r, 'sec': rs, 'util': ru, 'emis': re,
+                     'avg_slr': float(env.slr.mean()), 'max_slr': float(env.slr.max())})
+        jo = jo2
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. PLOTS
+# ─────────────────────────────────────────────────────────────────────────────
+def smooth(x, w=8):
+    """Moving average with edge-replicated padding so the boundaries don't
+    get dragged toward zero (np.convolve(..., mode='same') implicitly
+    zero-pads, which makes the last w/2 points artificially dip even when
+    the underlying data is flat/stable)."""
+    x = np.asarray(x, dtype=np.float64)
+    if len(x) < w:
+        return x.copy()
+    pad = w // 2
+    x_padded = np.pad(x, (pad, pad), mode='edge')
+    k = np.ones(w) / w
+    sm = np.convolve(x_padded, k, mode='valid')
+    return sm[:len(x)]
+
+def make_plots(hist, eval_df, dl, env, sdne_losses, embeddings, agent, outdir='/mnt/user-data/outputs'):
+    os.makedirs(outdir, exist_ok=True)
+    from sklearn.decomposition import PCA
+
+    fig = plt.figure(figsize=(20, 22))
+    gs_ = gridspec.GridSpec(4, 2, figure=fig, hspace=0.45, wspace=0.35)
+    eps = range(1, len(hist['tot']) + 1)
+
+    ax1 = fig.add_subplot(gs_[0, :])
+    ax1.plot(eps, smooth(hist['tot']), 'k-', lw=2, label='Total Reward')
+    ax1.plot(eps, smooth(hist['sec']), 'b--', lw=1.5, label='SLR Reward')
+    ax1.plot(eps, smooth(hist['util']), 'g--', lw=1.5, label='Utility Reward')
+    ax1.plot(eps, smooth(hist['emis']), 'r--', lw=1.5, label='Emission Reward')
+    ax1.set_title('MATD3 Training Curves — 257 Weight-Shared Station Agents\n'
+                  '(Shared Global Reward, Centralized Critic)', fontsize=13, fontweight='bold')
+    ax1.set_xlabel('Episode'); ax1.set_ylabel('Reward'); ax1.legend()
+
+    ax2 = fig.add_subplot(gs_[1, 0])
+    ax2.plot(eps, hist['cl'], 'm-', lw=1.5)
+    ax2.set_title('Centralized Critic Loss', fontsize=11, fontweight='bold')
+    ax2.set_xlabel('Episode'); ax2.set_ylabel('MSE')
+
+    ax3 = fig.add_subplot(gs_[1, 1])
+    ax3.plot(eps, hist['al'], color='darkorange', lw=1.5)
+    ax3.set_title('Shared Actor Loss (avg over agents)', fontsize=11, fontweight='bold')
+    ax3.set_xlabel('Episode'); ax3.set_ylabel('-Q')
+
+    ax4 = fig.add_subplot(gs_[2, 0])
+    ax4.plot(sdne_losses, color='teal', lw=2)
+    ax4.set_title('SDNE Loss (used for PDER scalar)', fontsize=11, fontweight='bold')
+    ax4.set_xlabel('Epoch'); ax4.set_ylabel('Loss')
+
+    ax5 = fig.add_subplot(gs_[2, 1])
+    pca = PCA(n_components=2)
+    emb2d = pca.fit_transform(embeddings)
+    pe = dl.entry_peak.reindex(dl.stations).fillna(0).values
+    sc = ax5.scatter(emb2d[:, 0], emb2d[:, 1], c=pe, cmap='YlOrRd', s=15, alpha=0.7)
+    plt.colorbar(sc, ax=ax5, label='Peak Entry')
+    ax5.set_title('SDNE Embeddings (PCA)', fontsize=11, fontweight='bold')
+
+    xt = range(len(eval_df))
+    ax6 = fig.add_subplot(gs_[3, 0])
+    ax6.plot(xt, eval_df['avg_slr'], 'b-', lw=2, label='Mean SLR')
+    ax6.plot(xt, eval_df['max_slr'], 'r--', lw=1.5, label='Max SLR')
+    ax6.axhline(0.6, color='orange', ls=':'); ax6.axhline(0.8, color='red', ls=':')
+    ax6.set_title('Evaluation: SLR Trajectory', fontsize=11, fontweight='bold')
+    ax6.set_xlabel('Step'); ax6.legend()
+
+    ax7 = fig.add_subplot(gs_[3, 1])
+    # Compare SLR with the trained policy vs. a no-guidance baseline
+    # (all-zero recommendation -> default shortest-path routing) on the
+    # SAME set of stations, so the chart actually shows the guidance effect
+    # instead of just listing already-saturated stations.
+    env.reset()
+    a_zero = np.zeros(dl.N, np.float32)
+    env.step(a_zero)
+    slr_noguide = env.slr.copy()
+
+    env.reset()
+    a_trained = agent.act(env.get_joint_obs(), noise=False)
+    env.step(a_trained)
+    slr_guided = env.slr.copy()
+
+    slr_noguide_s = pd.Series(slr_noguide, index=dl.stations)
+    top20_idx = slr_noguide_s.nlargest(20).index
+    guided_vals = pd.Series(slr_guided, index=dl.stations).loc[top20_idx]
+    noguide_vals = slr_noguide_s.loc[top20_idx]
+
+    x_pos = np.arange(20); w = 0.35
+    ax7.bar(x_pos - w/2, noguide_vals.values, w, color='gray', alpha=0.7, label='No guidance')
+    ax7.bar(x_pos + w/2, guided_vals.values, w, color='steelblue', label='MATD3 guided')
+    ax7.set_xticks(x_pos)
+    ax7.set_xticklabels(top20_idx, rotation=45, ha='right', fontsize=8)
+    ax7.axhline(0.8, color='red', ls='--', lw=1, alpha=0.7)
+    ax7.axhline(0.6, color='orange', ls='--', lw=1, alpha=0.7)
+    ax7.set_title('Top 20 Bottleneck Stations: With vs. Without Guidance', fontsize=11, fontweight='bold')
+    ax7.set_ylabel('SLR'); ax7.legend(fontsize=8); ax7.set_ylim(0, 1.05)
+
+    fig.suptitle('MATD3 — Multi-Agent Route Guidance, Delhi Metro\n'
+                 '257 station-agents, shared weights, centralized critic, global reward',
+                 fontsize=15, fontweight='bold', y=1.01)
+    fig.savefig(f'{outdir}/matd3_results.png', dpi=130, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[Plot] Saved -> {outdir}/matd3_results.png")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    OD_PATH = r"C:/Users/Lenovo/GRA_TD3/OD_Flow_Apr'23 (1).csv"
+    XLSX_PATH = r'C:/Users/Lenovo/GRA_TD3/stationwise_hourly_entry_exit_february_2024.xlsx'
+
+    dl = DelhiMetroDataLoader(OD_PATH, XLSX_PATH)
+
+    sdne = SDNE(dl.N, embed=32, hidden=64, alpha=0.01, gamma=0.1, lr=0.005, epochs=60)
+    sloss = sdne.fit(dl.od_matrix)
+    emb = sdne.embed(dl.od_matrix)
+
+    env = MultiAgentMetroEnv(dl, emb, omega=(1, 1, 1))
+
+    agent, hist = train_matd3(env, dl, n_ep=200, steps=36, warmup=300)
+    eval_df = evaluate_matd3(agent, env, n=36)
+
+    make_plots(hist, eval_df, dl, env, sloss, emb, agent)
+
+    # Re-run one clean evaluation pass so the summary reflects the trained
+    # policy's state, independent of any intermediate env mutations done
+    # for plotting comparisons above.
+    eval_df = evaluate_matd3(agent, env, n=36)
+
+    print("\n" + "=" * 60)
+    print("MATD3 RESULTS SUMMARY")
+    print("=" * 60)
+    s = slice(-10, None)
+    print(f"Last-10-ep avg: Total={np.mean(hist['tot'][s]):.4f} "
+          f"Sec={np.mean(hist['sec'][s]):.4f} "
+          f"Util={np.mean(hist['util'][s]):.4f} "
+          f"Emis={np.mean(hist['emis'][s]):.4f}")
+    slr_s = pd.Series(env.slr, index=dl.stations)
+    print(f"Final SLR: over={(slr_s>0.8).sum()} "
+          f"mid={((slr_s>0.6)&(slr_s<=0.8)).sum()} ok={(slr_s<=0.6).sum()}")
